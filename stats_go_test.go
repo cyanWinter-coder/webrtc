@@ -6,6 +6,10 @@
 package webrtc
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -875,12 +879,30 @@ func getSctpTransportStats(t *testing.T, report StatsReport) SCTPTransportStats 
 	return transportStats
 }
 
+func assertRemoteCertificateStats(
+	t *testing.T,
+	report StatsReport, transportStats TransportStats,
+	peerReport StatsReport, peerTransportStats TransportStats,
+) {
+	t.Helper()
+
+	remote, ok := report[transportStats.RemoteCertificateID].(CertificateStats)
+	require.True(t, ok)
+	peerLocal, ok := peerReport[peerTransportStats.LocalCertificateID].(CertificateStats)
+	require.True(t, ok)
+	assert.Equal(t, peerLocal.Fingerprint, remote.Fingerprint)
+	assert.Equal(t, peerLocal.Base64Certificate, remote.Base64Certificate)
+	assert.Empty(t, remote.IssuerCertificateID)
+}
+
 func getCertificateStats(t *testing.T, report StatsReport, certificate *Certificate) CertificateStats {
 	t.Helper()
 
 	certificateStats, ok := report.GetCertificateStats(certificate)
 	assert.True(t, ok)
 	assert.Equal(t, certificateStats.Type, StatsTypeCertificate)
+	assert.Equal(t, base64.StdEncoding.EncodeToString(certificate.x509Cert.Raw), certificateStats.Base64Certificate)
+	assert.Empty(t, certificateStats.IssuerCertificateID)
 
 	return certificateStats
 }
@@ -1258,6 +1280,8 @@ func TestPeerConnection_GetStats(t *testing.T) { //nolint:cyclop // involves mul
 	assert.GreaterOrEqual(t, answerTransportStats.BytesSent, offerTransportStats.BytesReceived)
 	assert.Contains(t, reportPCOffer, offerTransportStats.SelectedCandidatePairID)
 	assert.Contains(t, reportPCAnswer, answerTransportStats.SelectedCandidatePairID)
+	assertRemoteCertificateStats(t, reportPCOffer, offerTransportStats, reportPCAnswer, answerTransportStats)
+	assertRemoteCertificateStats(t, reportPCAnswer, answerTransportStats, reportPCOffer, offerTransportStats)
 
 	answerSCTPTransportStats := getSctpTransportStats(t, reportPCAnswer)
 	offerSCTPTransportStats := getSctpTransportStats(t, reportPCOffer)
@@ -1269,6 +1293,27 @@ func TestPeerConnection_GetStats(t *testing.T) { //nolint:cyclop // involves mul
 	for i := range certificates {
 		assert.NotEmpty(t, getCertificateStats(t, reportPCOffer, &certificates[i]))
 	}
+}
+
+func TestPeerConnection_GetStats_OnlyUsedCertificate(t *testing.T) {
+	var certificates []Certificate
+	for range 2 {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		certificate, err := GenerateCertificate(key)
+		require.NoError(t, err)
+		certificates = append(certificates, *certificate)
+	}
+
+	pc, err := NewPeerConnection(Configuration{Certificates: certificates})
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, pc.Close()) }()
+
+	report := pc.GetStats()
+	transportStats := getTransportStats(t, report, pc.dtlsTransport)
+	assert.Equal(t, getCertificateStats(t, report, &certificates[0]).ID, transportStats.LocalCertificateID)
+	_, ok := report.GetCertificateStats(&certificates[1])
+	assert.False(t, ok)
 }
 
 func TestPeerConnection_GetStats_Closed(t *testing.T) {
@@ -1776,8 +1821,21 @@ func TestStatsReport_GetICECandidatePairStats_Success(t *testing.T) {
 	assert.Equal(t, want, got)
 }
 
+func newTestCertificate(t *testing.T) (*Certificate, string) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	cert, err := GenerateCertificate(key)
+	require.NoError(t, err)
+	stats, err := newCertificateStats(cert.x509Cert)
+	require.NoError(t, err)
+
+	return cert, stats.ID
+}
+
 func TestStatsReport_GetCertificateStats_MissingEntry(t *testing.T) {
-	cert := &Certificate{statsID: "CERT1"}
+	cert, _ := newTestCertificate(t)
 	r := StatsReport{}
 
 	got, ok := r.GetCertificateStats(cert)
@@ -1787,10 +1845,10 @@ func TestStatsReport_GetCertificateStats_MissingEntry(t *testing.T) {
 }
 
 func TestStatsReport_GetCertificateStats_WrongType(t *testing.T) {
-	cert := &Certificate{statsID: "CERT2"}
+	cert, statsID := newTestCertificate(t)
 
 	r := StatsReport{
-		"CERT2": PeerConnectionStats{ID: "not-certificate"},
+		statsID: PeerConnectionStats{ID: "not-certificate"},
 	}
 
 	got, ok := r.GetCertificateStats(cert)
@@ -1800,8 +1858,7 @@ func TestStatsReport_GetCertificateStats_WrongType(t *testing.T) {
 }
 
 func TestStatsReport_GetCertificateStats_Success(t *testing.T) {
-	statsID := "CERT3"
-	cert := &Certificate{statsID: statsID}
+	cert, statsID := newTestCertificate(t)
 
 	want := CertificateStats{
 		ID:   statsID,
