@@ -37,6 +37,9 @@ type ICETransport struct {
 
 	ctxCancel func()
 
+	// restartCount tracks how many ICE restarts completed on this transport.
+	restartCount atomic.Uint32
+
 	loggerFactory logging.LoggerFactory
 
 	log logging.LeveledLogger
@@ -216,17 +219,34 @@ func (t *ICETransport) restart() error {
 
 	agent := t.gatherer.getAgent()
 	if agent == nil {
-		return fmt.Errorf("%w: unable to restart ICETransport", errICEAgentNotExist)
+		return fmt.Errorf("%w: unable to restart ICETransport (connection role %s)",
+			errICEAgentNotExist, t.role)
 	}
 
 	if err := agent.Restart(
 		t.gatherer.api.settingEngine.candidates.UsernameFragment,
 		t.gatherer.api.settingEngine.candidates.Password,
 	); err != nil {
+		t.log.Warnf("ICE restart failed for transport role %s: %v", t.role, err)
+
 		return err
 	}
 
-	return t.gatherer.Gather()
+	if err := t.gatherer.Gather(); err != nil {
+		t.log.Warnf("ICE candidate gathering exhausted/failed after restart for role %s: %v", t.role, err)
+
+		return err
+	}
+
+	t.restartCount.Add(1)
+
+	return nil
+}
+
+// RestartCount returns the number of successful ICE restarts performed on this
+// transport. It is used to correlate restart attempts with DTLS role recovery.
+func (t *ICETransport) RestartCount() uint32 {
+	return t.restartCount.Load()
 }
 
 // Stop irreversibly stops the ICETransport.

@@ -51,6 +51,15 @@ type DTLSTransport struct {
 
 	conn *dtls.Conn
 
+	// connectionID identifies the owning PeerConnection in restart log lines.
+	connectionID string
+	// negotiatedRole is the concrete role used by the current DTLS association.
+	negotiatedRole DTLSRole
+	// restartHandshakeTestHook lets tests inject handshake failures during an
+	// ICE restart without opening real DTLS connections. It is nil in
+	// production, where the existing association is reused.
+	restartHandshakeTestHook func(role DTLSRole) error
+
 	srtpSession, srtcpSession   atomic.Value
 	srtpEndpoint, srtcpEndpoint *mux.Endpoint
 	simulcastStreams            []simulcastStreamPair
@@ -155,6 +164,24 @@ func (t *DTLSTransport) State() DTLSTransportState {
 	defer t.lock.RUnlock()
 
 	return t.state
+}
+
+// Role returns the concrete DTLS role used by the current DTLS association,
+// or DTLSRoleUnknown until the first handshake has completed.
+func (t *DTLSTransport) Role() DTLSRole {
+	t.lock.RLock()
+	defer t.lock.RUnlock()
+
+	return t.negotiatedRole
+}
+
+// setConnectionID tags the transport with the owning PeerConnection identifier
+// so ICE restart errors can be correlated with the connection and its roles.
+func (t *DTLSTransport) setConnectionID(id string) {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	t.connectionID = id
 }
 
 // WriteRTCP sends a user provided RTCP packet to the connected peer. If no peer is connected the
@@ -417,7 +444,10 @@ func (t *DTLSTransport) prepareStart(remoteParameters DTLSParameters) (DTLSRole,
 	cert := t.certificates[0]
 	t.onStateChange(DTLSTransportStateConnecting)
 
-	return t.role(), tls.Certificate{
+	role := t.role()
+	t.negotiatedRole = role
+
+	return role, tls.Certificate{
 		Certificate: [][]byte{cert.x509Cert.Raw},
 		PrivateKey:  cert.privateKey,
 	}, nil
@@ -636,6 +666,81 @@ func (t *DTLSTransport) failStart(err error) error {
 	t.onStateChange(DTLSTransportStateFailed)
 
 	return err
+}
+
+// Restart renegotiates the DTLS role for an in-progress ICE restart. The
+// existing DTLS/SCTP association is preserved (RFC 8842): only the role
+// pairing is revalidated against the exchanged offer/answer. When both peers
+// resolve to the same role, the local role is flipped and retried exactly
+// once. A handshake hook failure, role conflict or undetermined role moves the
+// transport to DTLSTransportStateFailed and returns the underlying error.
+func (t *DTLSTransport) Restart(negotiation dtlsRoleRestartNegotiation) error {
+	t.lock.Lock()
+	defer t.lock.Unlock()
+
+	if t.state != DTLSTransportStateConnected {
+		err := fmt.Errorf("%w: restart requires %s, current state %s",
+			errInvalidDTLSStart, DTLSTransportStateConnected, t.state)
+		t.log.Warnf("ICE restart DTLS role negotiation aborted: connection %s role %s: %v",
+			negotiation.connectionID, t.negotiatedRole, err)
+
+		return err
+	}
+
+	if err := t.ensureICEConn(); err != nil {
+		t.log.Warnf("ICE restart DTLS role negotiation aborted: connection %s role %s: %v",
+			negotiation.connectionID, t.negotiatedRole, err)
+
+		return err
+	}
+
+	negotiator := newDTLSRoleRestartNegotiator(negotiation)
+
+	role, retried, err := negotiator.Next()
+	if err != nil {
+		return t.failRestart(negotiation, err)
+	}
+
+	if retried {
+		t.log.Warnf("DTLS role conflict detected on connection %s: retrying once with flipped role %s",
+			negotiation.connectionID, role)
+	}
+
+	if t.restartHandshakeTestHook != nil {
+		if err = t.restartHandshakeTestHook(role); err != nil {
+			return t.failRestart(negotiation, fmt.Errorf(
+				"connection %s DTLS restart handshake failed as %s: %w",
+				negotiation.connectionID, role, err))
+		}
+	} else if err = t.verifyRestartAssociation(role); err != nil {
+		return t.failRestart(negotiation, err)
+	}
+
+	t.negotiatedRole = role
+	t.log.Infof("ICE restart DTLS role negotiated: connection %s role %s",
+		negotiation.connectionID, role)
+
+	return nil
+}
+
+// verifyRestartAssociation confirms the reused DTLS association is still usable
+// for the resolved role without tearing down the data channels.
+func (t *DTLSTransport) verifyRestartAssociation(role DTLSRole) error {
+	if t.conn == nil {
+		return fmt.Errorf("%w: connection %s role %s", errSCTPTransportDTLS, t.connectionID, role)
+	}
+
+	return nil
+}
+
+// failRestart records the connection identifier and roles, moves the transport
+// to failed and returns the cause without reporting a successful handshake.
+func (t *DTLSTransport) failRestart(negotiation dtlsRoleRestartNegotiation, cause error) error {
+	t.log.Errorf("ICE restart DTLS negotiation failed: connection %s current role %s: %v",
+		negotiation.connectionID, t.negotiatedRole, cause)
+	t.onStateChange(DTLSTransportStateFailed)
+
+	return cause
 }
 
 func srtpProtectionProfileFromDTLSConn(dtlsConn *dtls.Conn) (srtp.ProtectionProfile, error) {

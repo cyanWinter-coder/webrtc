@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -383,6 +384,38 @@ func (r *SCTPTransport) onError(err error) {
 
 	if handler != nil {
 		go handler(err)
+	}
+}
+
+// dataChannelIdentifiers returns the sorted stream identifiers of every data
+// channel currently registered on the SCTP transport. The snapshot lets an ICE
+// restart verify that already-open data channels are preserved across the
+// DTLS role renegotiation instead of being silently dropped.
+func (r *SCTPTransport) dataChannelIdentifiers() []uint16 {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	ids := make([]uint16, 0, len(r.dataChannels))
+	for _, dataChannel := range r.dataChannels {
+		if id := dataChannel.ID(); id != nil {
+			ids = append(ids, *id)
+		}
+	}
+	slices.Sort(ids)
+
+	return ids
+}
+
+// notifyDataChannelsError delivers a restart failure to every data channel's
+// error handler without changing its ready state, so a failed restart can never
+// be mistaken for an open (or newly opened) data channel.
+func (r *SCTPTransport) notifyDataChannelsError(err error) {
+	r.lock.RLock()
+	dataChannels := append([]*DataChannel{}, r.dataChannels...)
+	r.lock.RUnlock()
+
+	for _, dataChannel := range dataChannels {
+		dataChannel.onError(err)
 	}
 }
 

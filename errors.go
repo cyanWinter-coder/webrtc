@@ -305,6 +305,14 @@ var (
 	errICETransportNotInNew = errors.New("ICETransport can only be called in ICETransportStateNew")
 	errICETransportClosed   = errors.New("ICETransport closed")
 
+	// ErrDTLSRoleConflict indicates both peers resolved to the same DTLS role
+	// during an ICE restart, so a DTLS client/server pair could not be formed.
+	ErrDTLSRoleConflict = errors.New("DTLS role conflict: both peers selected the same role")
+
+	// ErrDTLSRoleUndetermined indicates a DTLS role could not be resolved from
+	// the offer/answer descriptions during an ICE restart.
+	ErrDTLSRoleUndetermined = errors.New("DTLS role could not be determined from offer/answer")
+
 	errCertificatePEMMultipleCert = errors.New("failed parsing certificate, more than 1 CERTIFICATE block in pems")
 	errCertificatePEMMultiplePriv = errors.New("failed parsing certificate, more than 1 PRIVATE KEY block in pems")
 	errCertificatePEMMissing      = errors.New("failed parsing certificate, pems must contain both a CERTIFICATE block and a PRIVATE KEY block") // nolint: lll

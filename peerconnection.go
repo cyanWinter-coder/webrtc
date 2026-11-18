@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -187,6 +188,7 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 	if err != nil {
 		return nil, err
 	}
+	dtlsTransport.setConnectionID(pc.id)
 	pc.dtlsTransport = dtlsTransport
 
 	// Create the SCTP transport
@@ -1386,6 +1388,12 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 		if err = pc.iceTransport.setRemoteCredentials(iceDetails.Ufrag, iceDetails.Password); err != nil {
 			return err
 		}
+
+		// Re-validate the DTLS role pairing for the new ICE generation. The
+		// existing DTLS/SCTP association is reused; only role conflicts are
+		// resolved (with a single flipped-role retry). Running through the ops
+		// queue orders the negotiation against transport start/RTP work.
+		pc.ops.Enqueue(pc.renegotiateDTLSRole)
 	}
 
 	for i := range iceDetails.Candidates {
@@ -3059,6 +3067,57 @@ func (pc *PeerConnection) GetStats() StatsReport {
 	pc.api.mediaEngine.collectStats(statsCollector)
 
 	return statsCollector.Ready()
+}
+
+// renegotiateDTLSRole re-validates the DTLS role pairing while an ICE restart
+// is in flight. The already-established data channels are snapshotted first so
+// a successful restart can prove their identifiers are preserved, and a
+// failure is surfaced through the transport/connection states and data channel
+// error events instead of being swallowed or reported as success.
+func (pc *PeerConnection) renegotiateDTLSRole() {
+	if pc.isClosed.Load() {
+		return
+	}
+
+	pc.mu.RLock()
+	localDesc := pc.currentLocalDescription
+	remoteDesc := pc.currentRemoteDescription
+	pc.mu.RUnlock()
+
+	if localDesc == nil || remoteDesc == nil {
+		return
+	}
+
+	// The local answer means the remote side made the offer; we are only the
+	// offerer when our current local description is an offer.
+	isOfferer := localDesc.Type == SDPTypeOffer
+	preRestartDataChannelIDs := pc.sctpTransport.dataChannelIdentifiers()
+
+	negotiation := dtlsRoleRestartNegotiation{
+		connectionID: pc.id,
+		localDesc:    localDesc.parsed,
+		remoteDesc:   remoteDesc.parsed,
+		isOfferer:    isOfferer,
+	}
+
+	if err := pc.dtlsTransport.Restart(negotiation); err != nil {
+		pc.log.Errorf("ICE restart recovery failed for connection %s: %v", pc.id, err)
+		pc.sctpTransport.onError(err)
+		pc.sctpTransport.notifyDataChannelsError(err)
+		pc.updateConnectionState(pc.ICEConnectionState(), pc.dtlsTransport.State())
+
+		return
+	}
+
+	postRestartDataChannelIDs := pc.sctpTransport.dataChannelIdentifiers()
+	if !reflect.DeepEqual(preRestartDataChannelIDs, postRestartDataChannelIDs) {
+		pc.log.Warnf(
+			"ICE restart changed data channel identifiers on connection %s: before %v after %v",
+			pc.id, preRestartDataChannelIDs, postRestartDataChannelIDs,
+		)
+	}
+
+	pc.updateConnectionState(pc.ICEConnectionState(), pc.dtlsTransport.State())
 }
 
 // Start all transports. PeerConnection now has enough state.
